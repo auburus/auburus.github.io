@@ -1,1 +1,184 @@
-Hello world
+<h1>Copy module</h1>
+<p>Ansible's <a href="https://docs.ansible.com/ansible/latest/collections/ansible/builtin/copy_module.html">copy module</a>
+is one of the most widely used modules for its simplicity. Here is what you
+need to just copy a file to a remote server:</p>
+<pre><code class="language-bash">.
+├── files
+│   └── file.txt
+└── playbook.yml
+
+</code></pre>
+<pre><code class="language-yaml"># playbook.yml
+- hosts: all
+  tasks:
+  - name: Copy file
+    ansible.builtin.copy:
+      src: &quot;file.txt&quot;
+      dest: &quot;/tmp/file.txt&quot;
+</code></pre>
+<p>But in this blog post we will explore the main cases for copying files to a
+remote server, and see that in every case there is a better alternative than
+using <em>ansible.builtin.copy</em></p>
+<h2>Configuration files</h2>
+<p>Typical examples of configuration files could be <em>sshd.conf</em> or <em>nginx.conf</em>,
+and copying them is just a part of a higher level task such as "secure host"
+or "install webserver", usually encapsulated in a role/collection.</p>
+<p>After using ansible in deployments for the past couple years, I have noticed
+that the configuration file never ends up being deployed as-is, and that some
+part of the file needs to change depending on the host/deployment scenario/etc.</p>
+<p>This is where the <a href="https://docs.ansible.com/ansible/latest/collections/ansible/builtin/template_module.html">template module</a>
+really shines:</p>
+<pre><code class="language-bash">.
+├── templates
+│   └── file.txt.j2
+└── playbook.yml
+
+</code></pre>
+<pre><code class="language-yaml"># playbook.yml
+- hosts: all
+  tasks:
+  - name: Copy file
+    ansible.builtin.template:
+      src: &quot;file.txt.j2&quot;
+      dest: &quot;/tmp/file.txt&quot;
+</code></pre>
+<p>As we see, its usage looks the same as the <em>copy module</em>, but the trick is that
+<code>file.txt.j2</code> is now a Jinja2 file that has access to all the ansible variables:</p>
+<pre><code class="language-jinja"># file.txt.j2
+
+{% if inventory_hostname == &quot;webserver&quot; %}
+This is the webserver
+
+{% else %}
+Not the webserver, lets use a different configuration
+
+{% endif %}
+</code></pre>
+<p>Nowadays I put every configuration file in the <code>templates</code> directory, even if
+currently doesn't need any dynamic configuration, and that helps in two ways:
+- Avoid future refactor: When[^1] the requirement for the dynamic configuration comes,
+  it requires almost no effort to implement, since it is already using the <em>template module</em>.
+- Consistency: This is the key one for our team. By always using the <em>template
+  module</em> for configuration files, we all know where to look for them when opening
+  a new role or collection.</p>
+<p>[^1] If you ever think "There is no way this file will ever require dynamic
+modifications", the Project Manager is already typing the Jira ticket for that to
+change.</p>
+<h2>Binary files/Directory trees</h2>
+<p>Those are the other kind of files you want to copy to a remote server. Say the
+<code>jar</code> file or executable that the developers have finished, or a full tree for
+your python or ruby application.</p>
+<p>In those cases, the ansible module
+<a href="https://stackoverflow.com/questions/27985334/why-is-copying-a-directory-with-ansible-so-slow">is</a>
+<a href="https://github.com/ansible/ansible/issues/21513">slow</a>,
+despite having <a href="https://www.jeffgeerling.com/blog/2017/slow-ansible-playbook-check-ansiblecfg">pipelining</a>
+enabled.</p>
+<p>As those posts suggest, using the
+<a href="https://docs.ansible.com/ansible/latest/collections/ansible/posix/synchronize_module.html">synchronize module</a>
+significally speeds up your playbook, by leveraging rsync instead of scp, as we'll see
+in the following quick benchmark:</p>
+<pre><code class="language-shell">$ tree -h
+.
+├  [  84]  ansible.cfg
+├  [  60]  files
+│   └ [ 68M]  bigfile.txt
+├  [ 383]  playbook_copy.yml
+└  [ 425]  playbook_sync.yml
+</code></pre>
+<pre><code class="language-ini"># ansible.cfg
+[defaults]
+callback_whitelist = profile_tasks
+</code></pre>
+<p>The first playbook, using plain old copy, shows this results:</p>
+<pre><code class="language-yaml"># playbook_copy.yml
+---
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: remove file
+      ansible.builtin.file:
+        path: &quot;/tmp/bigfile.txt&quot;
+        state: absent
+
+    - name: copy file
+      ansible.builtin.copy:
+        src: &quot;bigfile.txt&quot;
+        dest: &quot;/tmp/bigfile.txt&quot;
+
+    - name: copy file (again)
+      ansible.builtin.copy:
+        src: &quot;bigfile.txt&quot;
+        dest: &quot;/tmp/bigfile.txt&quot;
+</code></pre>
+<pre><code class="language-bash">copy file ----------------------------------------------------- 81.03s
+copy file (again) ---------------------------------------------- 7.88s
+remove file ---------------------------------------------------- 4.84s
+</code></pre>
+<p>While the same thing, using syncrhonize:</p>
+<pre><code class="language-yaml"># playbook_sync.yml
+---
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: remove file
+      ansible.builtin.file:
+        path: &quot;/tmp/bigfile.txt&quot;
+        state: absent
+
+    - name: sync
+      ansible.posix.synchronize:
+        src: &quot;bigfile.txt&quot;
+        dest: &quot;/tmp/bigfile.txt&quot;
+        checksum: true
+
+    - name: sync (again)
+      ansible.posix.synchronize:
+        src: &quot;bigfile.txt&quot;
+        dest: &quot;/tmp/bigfile.txt&quot;
+        checksum: true
+</code></pre>
+<pre><code class="language-bash">sync ---------------------------------------------------------- 45.84s
+remove file ---------------------------------------------------- 4.97s
+sync (again) --------------------------------------------------- 4.17s
+</code></pre>
+<p>So we see that is about half the time, if we stick to the "regular" values
+of those modules. Just that makes it that, by default, we prefer to use
+the synchronize module.</p>
+<h3>Bonus: Can we make copy any faster?</h3>
+<p>Two main tricks are recommended to speed it up: Use pipelining (that is an
+ansible best practice in general) and set <code>force: false</code> in the copy module.</p>
+<pre><code class="language-ini"># ansible.cfg
+[defaults]
+callback_whitelist = profile_tasks
+
+[connection]
+pipelining = true
+</code></pre>
+<pre><code class="language-yaml"># playbook_copy.yml
+---
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: remove file
+      ansible.builtin.file:
+        path: &quot;/tmp/bigfile.txt&quot;
+        state: absent
+
+    - name: copy file
+      ansible.builtin.copy:
+        src: &quot;bigfile.txt&quot;
+        dest: &quot;/tmp/bigfile.txt&quot;
+        force: false
+
+    - name: copy file (again)
+      ansible.builtin.copy:
+        src: &quot;bigfile.txt&quot;
+        dest: &quot;/tmp/bigfile.txt&quot;
+        force: false
+</code></pre>
+<pre><code class="language-bash">copy file ----------------------------------------------------- 71.48s
+remove file ---------------------------------------------------- 3.66s
+copy file (again) ---------------------------------------------- 2.26s
+</code></pre>
+<p>Which saved ~10 sec compared to the original playbook, but is still
+significantly slower than synchronize.</p>
